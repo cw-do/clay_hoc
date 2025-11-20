@@ -1,0 +1,17 @@
+# House-of-cards structural model statistics
+
+N_particles: 5000
+N_contacts: 57791
+N_T_contacts: 21315
+N_parallel_contacts: 10826
+N_other_contacts: 25650
+T_contact_fraction: 0.3688290564274714
+parallel_contact_fraction: 0.187330207125677
+mean_contact_angle_deg: 89.83945661884526
+std_contact_angle_deg: 48.05768829468147
+mean_contact_angle_folded_deg: 50.07837348907404
+std_contact_angle_folded_deg: 26.7550166347945
+mean_degree: 23.1164
+max_degree: 167
+num_clusters: 218
+largest_cluster_size: 3885
