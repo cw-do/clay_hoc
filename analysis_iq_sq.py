@@ -27,7 +27,7 @@ from tqdm import tqdm         # unified progress bar + safe logging
 # CONFIGURATION
 # ============================================================
 
-DATA_DIR = "hoc_output_new0.5"
+DATA_DIR = "hoc_output"
 FILE_PATTERN = "hoc_structure_coords_*.csv"
 
 # Geometry of disc (must match hoc_structural_model.py)
@@ -38,7 +38,7 @@ DELTA_RHO = 1.0     # contrast (overall scale factor)
 # q-grid
 Q_MIN = 0.005
 Q_MAX = 5
-N_Q = 80
+N_Q = 100
 LOG_Q = True
 
 # Directions for orientational average
