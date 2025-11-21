@@ -18,8 +18,9 @@ Multiprocess batch generator for HoC clay disc structures.
         - stats_XXX.txt
         - degree_hist_XXX.csv
         - cluster_sizes_XXX.csv
-        - structure_XXX.png
-        - rows/row_XXXXXX.csv   <-- 1-row CSV for this config only
+        - structure_XXX.png                        (degree-colored)
+        - hoc_structure_XXX_percolated.png        (if percolated: red edges)
+        - rows/row_XXXXXX.csv                     (1-row CSV for this config only)
 
 - Master CSV:
     hoc_database_v1/hoc_database_stats.csv
@@ -38,6 +39,8 @@ from dataclasses import dataclass
 import numpy as np
 from tqdm import tqdm
 import multiprocessing as mp
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 import hoc_structural_model as hoc  # make sure this is in the same directory
 
@@ -53,7 +56,7 @@ PHI_VALUES = [0.005, 0.01, 0.02, 0.04, 0.06]
 PROB_NEW_SEED_VALUES = [0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
 
 # Number of configs per (phi, prob_new_seed)
-N_CONFIGS_PER_COMBO = 200  # <-- 큰 시뮬레이션 할 거라면 여기 조절
+N_CONFIGS_PER_COMBO = 200  # 큰 데이터베이스: 여기 조절
 
 # Box size (nm)
 BOX_SIZE = 2000.0
@@ -148,6 +151,79 @@ def ensure_combo_dir(phi_target: float, prob_new_seed: float) -> str:
     )
     os.makedirs(combo_dir, exist_ok=True)
     return combo_dir
+
+
+def plot_percolated_cluster(
+    positions: np.ndarray,
+    adjacency: list,
+    cluster_indices: list,
+    phi: float,
+    filename: str,
+) -> None:
+    """
+    Plot percolated cluster as thick red edges.
+
+    - All platelets: light gray points
+    - Largest percolated cluster: edges in red, nodes darker
+
+    Parameters
+    ----------
+    positions : (N,3) ndarray
+        Platelet centers.
+    adjacency : list[list[int]]
+        Contact adjacency list.
+    cluster_indices : list[int]
+        Indices belonging to the percolated (largest) cluster.
+    phi : float
+        Volume fraction.
+    filename : str
+        Output PNG path.
+    """
+    if len(cluster_indices) == 0:
+        return
+
+    centers = positions
+    cluster_set = set(cluster_indices)
+
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # All particles as light gray background
+    ax.scatter(
+        centers[:, 0], centers[:, 1], centers[:, 2],
+        s=3, c="lightgray", alpha=0.15
+    )
+
+    # Cluster nodes as darker markers
+    cpos = centers[cluster_indices]
+    ax.scatter(
+        cpos[:, 0], cpos[:, 1], cpos[:, 2],
+        s=8, c="black", alpha=0.7
+    )
+
+    # Cluster edges as thick red lines
+    for i in cluster_indices:
+        for j in adjacency[i]:
+            if j in cluster_set and j > i:
+                xs = [centers[i, 0], centers[j, 0]]
+                ys = [centers[i, 1], centers[j, 1]]
+                zs = [centers[i, 2], centers[j, 2]]
+                ax.plot(xs, ys, zs, color="red", linewidth=2.0, alpha=0.9)
+
+    ax.set_xlim(0.0, BOX_SIZE)
+    ax.set_ylim(0.0, BOX_SIZE)
+    ax.set_zlim(0.0, BOX_SIZE)
+    ax.set_xlabel("X (nm)")
+    ax.set_ylabel("Y (nm)")
+    ax.set_zlabel("Z (nm)")
+    ax.set_box_aspect((1.0, 1.0, 1.0))
+
+    ax.set_title(f"Percolated cluster (red edges)\nφ = {phi:.4e}")
+
+    plt.tight_layout()
+    plt.savefig(filename, dpi=220)
+    plt.close()
+    hoc.info(f"[INFO] Saved percolated structure snapshot: {filename}")
 
 
 # ==============================
@@ -260,7 +336,6 @@ def run_job(job: Job):
         span_z = float(cluster_pos[:, 2].max() - cluster_pos[:, 2].min())
 
         # percolation: spanning the box along any axis
-        # allow for disc radius at both ends: L - 2*R
         span_threshold = BOX_SIZE - 2.0 * hoc.RADIUS
         percolation_flag = int(
             (span_x >= span_threshold) or
@@ -274,6 +349,7 @@ def run_job(job: Job):
         span_y = float("nan")
         span_z = float("nan")
         percolation_flag = 0
+        largest_cluster_indices = []
 
     # contact distance statistics
     if n_contacts > 0:
@@ -302,17 +378,32 @@ def run_job(job: Job):
     degree_hist_file = f"degree_hist_{postfix}.csv"
     cluster_sizes_file = f"cluster_sizes_{postfix}.csv"
     structure_png_file = f"structure_{postfix}.png"
+    percolated_png_file = f"hoc_structure_{postfix}_percolated.png" if percolation_flag else ""
 
     coords_path = os.path.join(combo_dir, coords_file)
     stats_path = os.path.join(combo_dir, stats_file)
     degree_hist_path = os.path.join(combo_dir, degree_hist_file)
     cluster_sizes_path = os.path.join(combo_dir, cluster_sizes_file)
     structure_png_path = os.path.join(combo_dir, structure_png_file)
+    percolated_png_path = (
+        os.path.join(combo_dir, percolated_png_file) if percolated_png_file else ""
+    )
 
     # coordinates
     hoc.save_coordinates(platelets, coords_path)
 
-    # detailed stats text (include spans & percolation)
+    # degree-colored structure snapshot
+    hoc.plot_structure_colored_by_degree(
+        platelets, degrees, phi_actual, structure_png_path
+    )
+
+    # percolated path snapshot (if percolated)
+    if percolation_flag and largest_cluster_indices:
+        plot_percolated_cluster(
+            positions, adjacency, largest_cluster_indices, phi_actual, percolated_png_path
+        )
+
+    # detailed stats text (include spans & percolation & percolated image file)
     stats_dict = {
         "global_config_id": job.global_config_id,
         "local_config_index": job.local_index,
@@ -353,6 +444,7 @@ def run_job(job: Job):
         "degree_hist_file": degree_hist_file,
         "cluster_sizes_file": cluster_sizes_file,
         "structure_png_file": structure_png_file,
+        "percolated_structure_png_file": percolated_png_file,
     }
     hoc.save_stats(stats_dict, stats_path)
 
@@ -394,11 +486,6 @@ def run_job(job: Job):
             comments=""
         )
 
-    # structure snapshot (degree-colored)
-    hoc.plot_structure_colored_by_degree(
-        platelets, degrees, phi_actual, structure_png_path
-    )
-
     # --- 5) Build row for this config (same order as master_headers in main) ---
     row = [
         job.global_config_id,
@@ -439,6 +526,7 @@ def run_job(job: Job):
         os.path.relpath(degree_hist_path, OUTPUT_ROOT),
         os.path.relpath(cluster_sizes_path, OUTPUT_ROOT),
         os.path.relpath(structure_png_path, OUTPUT_ROOT),
+        os.path.relpath(percolated_png_path, OUTPUT_ROOT) if percolated_png_path else "",
     ]
 
     # --- 6) Save per-job row CSV (atomic output for this config) ---
@@ -534,6 +622,7 @@ def main():
         "degree_hist_file",
         "cluster_sizes_file",
         "structure_png_file",
+        "percolated_structure_png_file",
     ]
 
     if jobs:
