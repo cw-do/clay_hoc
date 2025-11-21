@@ -3,64 +3,27 @@ hoc_structural_model.py
 
 Structural generator for clay-like disc platelets forming "house-of-cards" (HoC) networks.
 
-Goal
-----
+Features
+--------
 - Generate 3D configurations of disc-like clay platelets in a cubic box.
-- Capture two main structural motifs:
-    (1) "Seeds": platelets placed as separated free particles
-    (2) "Attached": platelets added near existing ones with orientation rules
-        that promote T-configurations (≈90°) and parallel stacks.
-- Export center-of-mass positions and orientation vectors for later analysis
-  (e.g., SANS I(q) calculation).
-- Provide quick 3D snapshots as PNG images.
-- Show a **single unified progress bar** across all configurations and all particles.
-
-Key ideas
----------
-- Geometry:
-    - Each clay platelet is modeled as a thin circular disc:
-          radius  RADIUS (nm)
-          thickness THICKNESS (nm)
-    - The simulation box is a cube of side BOX_SIZE (nm).
-- Growth model:
-    - Start from a single "seed" platelet at the box center.
-    - For each new platelet:
-        - With probability PROB_NEW_SEED:
-            → Place a new "seed" far from all existing platelets
-        - With probability 1 - PROB_NEW_SEED:
-            → Attach to a randomly chosen parent platelet with one of:
-                 * T-contact-like orientation
-                 * parallel-like orientation
-                 * random orientation
-- Distances:
-    - Attached platelets are placed at a parent–child center distance drawn
-      from a Gaussian distribution around CENTER_DISTANCE_MEAN with spread
-      CENTER_DISTANCE_STD.
-    - New "seed" platelets are placed such that their center is at least
-      MIN_SEED_DISTANCE away from all existing centers (rejection sampling).
-- Output:
-    - Coordinates: x,y,z and normal vector components nx,ny,nz in CSV.
-    - Structure snapshot: discs drawn as polygons in 3D, saved as PNG.
-    - Volume fraction is estimated assuming each disc volume is πR²T.
-
-Dependencies
-------------
-- numpy
-- matplotlib
-- numba     (not strictly required here but kept for future extension)
-- tqdm      (for the unified progress bar)
-
-Typical usage
--------------
-    python hoc_structural_model.py
-
-Then, use your separate analysis script (e.g. analysis_iq_sq.py) to compute
-g(r), I(q), S(q), etc. from the generated coordinates.
+- Two growth modes:
+    (1) "Seeds": new platelets placed far from existing ones
+    (2) "Attached": new platelets added near existing ones with T/parallel/random
+        orientation rules (HoC-like contacts).
+- After building a configuration:
+    * Build contact network using a fast cell-list + numba neighbour search.
+    * Classify contacts as T / parallel / other based on normal–normal angle.
+    * Compute degree distribution, contact fractions, cluster sizes.
+    * Save:
+        - coordinates (x,y,z,nx,ny,nz) → hoc_structure_coords_XXX.csv
+        - structural stats → hoc_stats_XXX.txt
+        - 3D snapshot with discs coloured by degree + colourbar → hoc_structure_XXX.png
+- Single unified tqdm progress bar for all configs × particles.
 """
 
 import os
 import math
-from collections import deque  # (current version doesn't use it, but kept for possible extension)
+from collections import deque
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -68,104 +31,89 @@ from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from numba import njit, prange  # not essential in this minimal version, but left here for future use
+from numba import njit, prange
 from tqdm import tqdm
 
 
 # ============================================================
-# Global simulation parameters (user-tunable)
+# Global parameters (user-tunable)
 # ============================================================
 
-# Number of independent configurations to generate
-N_CONFIGS = 20
+# Number of independent configurations
+N_CONFIGS = 10
 
-# Base random seed; actual seed used will be BASE_SEED + config_index
+# Base random seed; actual seed = BASE_SEED + config_index
 BASE_SEED = 0
 
-# Number of platelets per configuration
-#   - Typical range you mentioned: 1000–20000
-N_PARTICLES = 2000
+# Number of platelets per configuration (typical: 1e3–2e4)
+N_PARTICLES = 50000
 
 # Disc geometry (nm)
-#   RADIUS    : clay platelet radius
-#   THICKNESS : platelet thickness
-RADIUS = 25.0
-THICKNESS = 1.0
+RADIUS = 25.0      # platelet radius
+THICKNESS = 1.0    # platelet thickness
 
-# Simulation box size (nm)
-#   - We assume a cubic box [0, BOX_SIZE]^3
+# Simulation box: cube [0, BOX_SIZE]^3 (nm)
 BOX_SIZE = 3000.0
 
-# Output folder where CSV and PNG files will be written
-OUTPUT_DIR = "hoc_output_prob0.00"
+# Output directory
+OUTPUT_DIR = "hoc_output_prob0.8_random_n50000"
 
-# Probability that a newly added platelet is a "new seed"
-#   - With probability PROB_NEW_SEED:
-#         place a new free seed, far away from existing platelets
-#   - With probability 1 - PROB_NEW_SEED:
-#         attach to an existing platelet with T/parallel/random orientation
-PROB_NEW_SEED = 0.0
+# Probability for a new platelet to be a "new seed"
+#   With probability PROB_NEW_SEED:
+#       - place a new free seed far from existing platelets
+#   With probability 1 - PROB_NEW_SEED:
+#       - attach to a parent platelet with T/parallel/random orientation
+PROB_NEW_SEED = 0.8
 
-# Orientation probabilities for attached platelets
-#   - When we attach a new platelet to a parent, we choose:
-#        PROB_T       : T-contact-like orientation (≈90° between normals)
-#        PROB_PARALLEL: parallel orientation (≈0° or 180° between normals)
-#        PROB_RANDOM  : fully random orientation
-PROB_T = 0.6
-PROB_PARALLEL = 0.3
-PROB_RANDOM = 0.1
+# Orientation probabilities for ATTACHED platelets
+PROB_T = 0        # prefer T-contact (≈90° between normals)
+PROB_PARALLEL = 0 # parallel (≈0° or 180°)
+PROB_RANDOM = 1   # fully random
 
-# Angular spread (in degrees) for the orientation rules
-#   - ANGLE_SIGMA_T_DEG:
-#         Gaussian spread around 90° for T-contact-like orientation
-#   - ANGLE_SIGMA_PARALLEL_DEG:
-#         Gaussian spread around 0° or 180° for parallel-like orientation
-ANGLE_SIGMA_T_DEG = 10.0
-ANGLE_SIGMA_PARALLEL_DEG = 10.0
+# Angular spreads (deg) for orientation rules
+ANGLE_SIGMA_T_DEG = 180.0         # spread around 90°
+ANGLE_SIGMA_PARALLEL_DEG = 10.0  # spread around 0° or 180°
 
-# Parent–child center distance for attached platelets (nm)
-#   - Drawn from Gaussian with mean and std below, then floored at 1.5 * RADIUS
+# Parent–child distance for attached platelets (nm)
 CENTER_DISTANCE_MEAN = 2.2 * RADIUS
 CENTER_DISTANCE_STD = 0.25 * RADIUS
 
-# Minimum separation for newly seeded (free) platelets (nm)
-#   - We attempt to place a new seed so that the distance from all existing
-#     platelets is at least MIN_SEED_DISTANCE.
-#   - If this fails after MAX_SEED_TRIES attempts, we accept the last candidate
-#     (i.e., constraint may be slightly violated in very dense cases).
-MIN_SEED_DISTANCE = 2.4 * RADIUS
+# Contact detection thresholds
+#   - CONTACT_DISTANCE_THRESHOLD : max center distance for "touching"
+#   - T_ANGLE_CENTER_DEG, T_ANGLE_WIDTH_DEG : T-contact window
+#   - PAR_ANGLE_WIDTH_DEG : parallel window (small angle after folding)
+CONTACT_DISTANCE_THRESHOLD = 2.4 * RADIUS  # nm
+T_ANGLE_CENTER_DEG = 90.0
+T_ANGLE_WIDTH_DEG = 25.0
+PAR_ANGLE_WIDTH_DEG = 20.0
+
+# New seed placement: try to keep centers ≥ MIN_SEED_DISTANCE apart
+MIN_SEED_DISTANCE = CONTACT_DISTANCE_THRESHOLD
 MAX_SEED_TRIES = 1000
 
-# Maximum number of discs to draw in snapshot (for speed)
-MAX_DISCS_TO_DRAW = 2000
+# Plotting
+MAX_DISCS_TO_DRAW = 2000  # for very large N, draw only a subset
 
 
 # ============================================================
-# Helper: logging that doesn't break tqdm progress bar
+# Helper: logging that doesn't break tqdm bar
 # ============================================================
 
 def info(msg: str) -> None:
     """
-    Print an informational message without breaking the tqdm progress bar.
-
-    We use tqdm.write instead of plain print so the progress bar remains
-    on a single line and is re-drawn cleanly after each message.
+    Print informational messages via tqdm.write so that tqdm progress
+    bar stays on a single line and isn't corrupted by prints.
     """
     tqdm.write(msg)
 
 
 # ============================================================
-# Basic vector utilities
+# Basic vector + random utilities
 # ============================================================
 
 def random_unit_vector() -> np.ndarray:
     """
     Draw a random unit vector uniformly on the sphere.
-
-    Returns
-    -------
-    v : (3,) ndarray
-        Random vector with |v| = 1.
     """
     z = 2.0 * np.random.rand() - 1.0
     phi = 2.0 * np.pi * np.random.rand()
@@ -177,10 +125,7 @@ def random_unit_vector() -> np.ndarray:
 
 def random_angle(center_deg: float, sigma_deg: float) -> float:
     """
-    Sample an angle (in radians) from a Gaussian around center_deg with
-    standard deviation sigma_deg.
-
-    e.g. center_deg ≈ 90° for T-contact, 0° or 180° for parallel contact.
+    Sample an angle (in radians) from N(center_deg, sigma_deg^2) in degrees.
     """
     return np.deg2rad(np.random.normal(center_deg, sigma_deg))
 
@@ -191,14 +136,14 @@ def random_angle(center_deg: float, sigma_deg: float) -> float:
 
 class ClayPlatelet:
     """
-    Simple representation of a disc-like clay platelet.
+    Disc-like clay platelet.
 
     Attributes
     ----------
     pos : (3,) ndarray
         Center-of-mass position in nm.
     n   : (3,) ndarray
-        Unit normal vector of the disc (orientation).
+        Unit normal vector of the disc.
     """
 
     __slots__ = ("pos", "n")
@@ -206,21 +151,20 @@ class ClayPlatelet:
     def __init__(self, pos, n) -> None:
         pos = np.array(pos, dtype=float)
         n = np.array(n, dtype=float)
-        n_norm = np.linalg.norm(n)
-        if n_norm < 1e-12:
+        norm = np.linalg.norm(n)
+        if norm < 1e-12:
             raise ValueError("Normal vector too small.")
         self.pos = pos
-        self.n = n / n_norm
+        self.n = n / norm
 
     def basis(self):
         """
-        Construct an orthonormal basis (u, v, n) for the disc:
-
-        u, v lie in the disc plane; n is the stored normal.
+        Construct orthonormal basis (u, v, n) for the disc frame.
 
         Returns
         -------
-        u, v, n : tuple of (3,) ndarrays
+        u, v, n : (3,) ndarrays
+            u, v lie in disc plane; n is the stored normal.
         """
         n = self.n
         base = np.array([1.0, 0.0, 0.0])
@@ -234,25 +178,24 @@ class ClayPlatelet:
 
 
 # ============================================================
-# Seeding with minimum distance constraint
+# Seed placement with minimum distance constraint
 # ============================================================
 
 def place_new_seed(existing_positions: np.ndarray) -> np.ndarray:
     """
-    Place a new "seed" platelet in the box, attempting to keep it
-    at least MIN_SEED_DISTANCE away from all existing particle centers.
+    Place a new "seed" platelet, trying to keep it at least MIN_SEED_DISTANCE
+    away from all existing centers.
+
+    If this fails after MAX_SEED_TRIES, returns the last candidate position.
 
     Parameters
     ----------
     existing_positions : (M,3) ndarray or None
-        Positions of existing platelets.
 
     Returns
     -------
     pos_new : (3,) ndarray
-        New seed position.
     """
-    # If this is the very first particle, just draw it anywhere in the box
     if existing_positions is None or existing_positions.size == 0:
         return np.random.rand(3) * BOX_SIZE
 
@@ -264,7 +207,6 @@ def place_new_seed(existing_positions: np.ndarray) -> np.ndarray:
             return pos
         last_candidate = pos
 
-    # Fallback: we failed to find a perfectly separated position; use last candidate
     return last_candidate if last_candidate is not None else (np.random.rand(3) * BOX_SIZE)
 
 
@@ -274,15 +216,12 @@ def place_new_seed(existing_positions: np.ndarray) -> np.ndarray:
 
 def make_T_normal(parent_n: np.ndarray) -> np.ndarray:
     """
-    Generate a new normal vector roughly at 90° (T-contact-like)
-    relative to the parent normal.
-
-    That is, if n_parent is the parent normal and n_new is the child normal,
-    the angle between them is distributed around 90° with width ANGLE_SIGMA_T_DEG.
+    Generate new normal approximately T-contact-like w.r.t parent_n
+    (angle ≈ 90° with Gaussian spread ANGLE_SIGMA_T_DEG).
     """
     parent_n = parent_n / (np.linalg.norm(parent_n) + 1e-12)
 
-    # Find a vector orthogonal to parent_n
+    # vector orthogonal to parent_n
     base = np.array([1.0, 0.0, 0.0])
     if abs(np.dot(base, parent_n)) > 0.9:
         base = np.array([0.0, 1.0, 0.0])
@@ -290,92 +229,74 @@ def make_T_normal(parent_n: np.ndarray) -> np.ndarray:
     b /= (np.linalg.norm(b) + 1e-12)
 
     angle = random_angle(90.0, ANGLE_SIGMA_T_DEG)
-    n_new = math.cos(angle) * parent_n + math.sin(angle) * b
+    n_new = math.cos(angle)*parent_n + math.sin(angle)*b
     return n_new / (np.linalg.norm(n_new) + 1e-12)
 
 
 def make_parallel_normal(parent_n: np.ndarray) -> np.ndarray:
     """
-    Generate a new normal vector roughly parallel (0° or 180°) to parent_n.
-
-    Procedure:
-    - Choose target angle = 0° or 180° with equal probability.
-    - Draw a small deviation from a Gaussian with std ANGLE_SIGMA_PARALLEL_DEG.
-    - Rotate parent_n by that small angle around a random axis perpendicular to it.
+    Generate new normal approximately parallel (0° or 180°) to parent_n.
     """
     parent_n = parent_n / (np.linalg.norm(parent_n) + 1e-12)
 
-    # Choose 0° or 180° as the center
     center_deg = 0.0 if np.random.rand() < 0.5 else 180.0
     angle = random_angle(center_deg, ANGLE_SIGMA_PARALLEL_DEG)
 
-    # Find a rotation axis orthogonal to parent_n
     base = np.array([1.0, 0.0, 0.0])
     if abs(np.dot(base, parent_n)) > 0.9:
         base = np.array([0.0, 1.0, 0.0])
     axis = np.cross(parent_n, base)
     axis /= (np.linalg.norm(axis) + 1e-12)
 
-    # Rodrigues' rotation formula
     K = np.array([
-        [0.0,      -axis[2],  axis[1]],
-        [axis[2],   0.0,     -axis[0]],
-        [-axis[1],  axis[0],  0.0   ],
+        [0.0,        -axis[2],  axis[1]],
+        [axis[2],     0.0,     -axis[0]],
+        [-axis[1],    axis[0],  0.0   ],
     ])
     I = np.eye(3)
-    R = I + math.sin(angle) * K + (1.0 - math.cos(angle)) * (K @ K)
+    R = I + math.sin(angle)*K + (1.0 - math.cos(angle))*(K @ K)
 
     n_new = R @ parent_n
     return n_new / (np.linalg.norm(n_new) + 1e-12)
 
 
 # ============================================================
-# Structure builder with unified progress bar
+# Structure builder (uses unified progress bar)
 # ============================================================
 
 def build_structure_with_progress(n_particles: int, pbar: tqdm) -> list:
     """
-    Build a single "house-of-cards-like" configuration of platelets.
+    Build one HoC-like configuration of n_particles platelets.
 
-    Parameters
-    ----------
-    n_particles : int
-        Number of platelets in this configuration.
-    pbar : tqdm instance
-        Global progress bar shared across configurations. We call pbar.update(1)
-        for each platelet that is added.
+    Each added platelet increments the shared progress bar by 1.
 
     Returns
     -------
-    platelets : list of ClayPlatelet
-        The complete list of platelets in the configuration.
+    platelets : list[ClayPlatelet]
     """
     platelets = []
 
-    # --- 1) First seed at box center ---
+    # First seed at box center
     center = np.array([BOX_SIZE/2.0, BOX_SIZE/2.0, BOX_SIZE/2.0])
     n0 = random_unit_vector()
     platelets.append(ClayPlatelet(center, n0))
     pbar.update(1)
 
-    # --- 2) Grow the remaining platelets ---
-    for k in range(1, n_particles):
-        # Extract existing positions for seed placement
+    # Grow the rest
+    for _ in range(1, n_particles):
         existing_positions = np.array([p.pos for p in platelets], dtype=float)
 
-        # Decide: new free seed vs attached platelet
         if np.random.rand() < PROB_NEW_SEED:
-            # New seed: far from existing platelets
+            # New seed, with distance constraint
             pos_new = place_new_seed(existing_positions)
             n_new = random_unit_vector()
             platelets.append(ClayPlatelet(pos_new, n_new))
 
         else:
-            # Attached platelet: choose a parent uniformly at random
+            # Attached platelet
             parent_idx = np.random.randint(len(platelets))
             parent = platelets[parent_idx]
 
-            # Choose orientation rule
             r = np.random.rand()
             if r < PROB_T:
                 n_new = make_T_normal(parent.n)
@@ -384,88 +305,320 @@ def build_structure_with_progress(n_particles: int, pbar: tqdm) -> list:
             else:
                 n_new = random_unit_vector()
 
-            # Choose parent–child distance
             dist = np.random.normal(CENTER_DISTANCE_MEAN, CENTER_DISTANCE_STD)
-            dist = max(dist, 1.5 * RADIUS)
-
-            # Random direction from parent
+            dist = max(dist, 1.5*RADIUS)
             d_hat = random_unit_vector()
-            pos_new = parent.pos + dist * d_hat
-
-            # Clip to box boundaries
+            pos_new = parent.pos + dist*d_hat
             pos_new = np.clip(pos_new, 0.0, BOX_SIZE)
 
             platelets.append(ClayPlatelet(pos_new, n_new))
 
-        # Update global progress bar by one platelet
         pbar.update(1)
 
     return platelets
 
 
 # ============================================================
-# Visualization (3D disc snapshot)
+# Fast neighbour search via cell lists (numba)
 # ============================================================
 
-def disc_polygon(platelet: ClayPlatelet, rad: float = RADIUS, n_segments: int = 30):
+@njit
+def _build_cell_list(positions, box_size, cell_size):
     """
-    Generate a polygonal approximation of a disc in 3D for plotting.
+    Build a simple 3D cell list for neighbour search.
+    """
+    N = positions.shape[0]
+    ncell = int(box_size // cell_size) + 1
 
-    Parameters
-    ----------
-    platelet : ClayPlatelet
-        The platelet to draw.
-    rad : float, optional
-        Radius to use for the disc (should match RADIUS).
-    n_segments : int, optional
-        Number of segments around the circle.
+    counts = np.zeros((ncell, ncell, ncell), dtype=np.int64)
+    cell_index = np.empty((N, 3), dtype=np.int64)
+
+    for i in range(N):
+        x, y, z = positions[i, 0], positions[i, 1], positions[i, 2]
+        cx = int(x // cell_size)
+        cy = int(y // cell_size)
+        cz = int(z // cell_size)
+        if cx < 0: cx = 0
+        if cy < 0: cy = 0
+        if cz < 0: cz = 0
+        if cx >= ncell: cx = ncell-1
+        if cy >= ncell: cy = ncell-1
+        if cz >= ncell: cz = ncell-1
+        cell_index[i, 0] = cx
+        cell_index[i, 1] = cy
+        cell_index[i, 2] = cz
+        counts[cx, cy, cz] += 1
+
+    offsets = np.zeros_like(counts)
+    acc = 0
+    for ix in range(ncell):
+        for iy in range(ncell):
+            for iz in range(ncell):
+                offsets[ix, iy, iz] = acc
+                acc += counts[ix, iy, iz]
+
+    cell_particles = np.empty(N, dtype=np.int64)
+    temp_counts = np.zeros_like(counts)
+
+    for i in range(N):
+        cx, cy, cz = cell_index[i, 0], cell_index[i, 1], cell_index[i, 2]
+        idx = offsets[cx, cy, cz] + temp_counts[cx, cy, cz]
+        cell_particles[idx] = i
+        temp_counts[cx, cy, cz] += 1
+
+    return cell_index, offsets, counts, cell_particles, ncell
+
+
+@njit(parallel=True)
+def _find_contacts_with_cells(positions, normals,
+                              box_size, cutoff,
+                              cell_size):
+    """
+    Use cell lists + numba parallel loops to find contacting pairs.
 
     Returns
     -------
-    verts : list of (3,) ndarrays
-        Vertex positions around the disc edge in 3D.
+    pair_i, pair_j, pair_ang : 1D arrays
+        Contact pairs (i<j) and their normal–normal angles (degrees).
+    """
+    N = positions.shape[0]
+    cutoff2 = cutoff * cutoff
+
+    cell_index, offsets, counts, cell_particles, ncell = \
+        _build_cell_list(positions, box_size, cell_size)
+
+    max_pairs = 40 * N  # heuristic upper bound
+    pair_i = np.empty(max_pairs, dtype=np.int64)
+    pair_j = np.empty(max_pairs, dtype=np.int64)
+    pair_ang = np.empty(max_pairs, dtype=np.float64)
+
+    pair_count_arr = np.zeros(1, dtype=np.int64)
+
+    for i in prange(N):
+        cx, cy, cz = cell_index[i, 0], cell_index[i, 1], cell_index[i, 2]
+
+        for dx in (-1, 0, 1):
+            nx = cx + dx
+            if nx < 0 or nx >= ncell:
+                continue
+            for dy in (-1, 0, 1):
+                ny = cy + dy
+                if ny < 0 or ny >= ncell:
+                    continue
+                for dz in (-1, 0, 1):
+                    nz = cz + dz
+                    if nz < 0 or nz >= ncell:
+                        continue
+
+                    start = offsets[nx, ny, nz]
+                    cnt = counts[nx, ny, nz]
+                    for k in range(cnt):
+                        j = cell_particles[start + k]
+                        if j <= i:
+                            continue
+
+                        dx_ = positions[j, 0] - positions[i, 0]
+                        dy_ = positions[j, 1] - positions[i, 1]
+                        dz_ = positions[j, 2] - positions[i, 2]
+                        r2 = dx_*dx_ + dy_*dy_ + dz_*dz_
+                        if r2 > cutoff2:
+                            continue
+
+                        # angle between normals
+                        n1x, n1y, n1z = normals[i, 0], normals[i, 1], normals[i, 2]
+                        n2x, n2y, n2z = normals[j, 0], normals[j, 1], normals[j, 2]
+                        dot = n1x*n2x + n1y*n2y + n1z*n2z
+                        if dot > 1.0:
+                            dot = 1.0
+                        if dot < -1.0:
+                            dot = -1.0
+                        ang_rad = math.acos(dot)
+                        ang_deg = ang_rad * 180.0 / math.pi
+
+                        idx_pair = pair_count_arr[0]
+                        if idx_pair >= max_pairs:
+                            continue
+                        pair_i[idx_pair] = i
+                        pair_j[idx_pair] = j
+                        pair_ang[idx_pair] = ang_deg
+                        pair_count_arr[0] = idx_pair + 1
+
+    pair_count = pair_count_arr[0]
+    return pair_i[:pair_count], pair_j[:pair_count], pair_ang[:pair_count]
+
+
+def classify_contact(angle_deg: float) -> str:
+    """
+    Classify contact type based on normal–normal angle in degrees.
+
+    Returns
+    -------
+    "T", "parallel", or "other".
+    """
+    # fold angle into [0, 90] for checking parallel
+    if angle_deg > 90.0:
+        angle_eff = 180.0 - angle_deg
+    else:
+        angle_eff = angle_deg
+
+    # T-contact window around T_ANGLE_CENTER_DEG
+    if abs(angle_deg - T_ANGLE_CENTER_DEG) < T_ANGLE_WIDTH_DEG:
+        return "T"
+
+    # near-parallel if folded angle is small
+    if angle_eff < PAR_ANGLE_WIDTH_DEG:
+        return "parallel"
+
+    return "other"
+
+
+def build_contact_network_fast(platelets: list):
+    """
+    Build contact network for the given platelets.
+
+    Uses a cell list with cutoff = CONTACT_DISTANCE_THRESHOLD.
+
+    Returns
+    -------
+    adjacency : list[set[int]]
+        Neighbour indices for each node.
+    contact_types : dict[(int,int) -> str]
+        Contact type ("T", "parallel", "other") for each pair (i,j) with i<j.
+    angles_deg : (M,) ndarray
+        All normal–normal angles (deg) for contacting pairs.
+    """
+    N = len(platelets)
+    positions = np.empty((N, 3), dtype=np.float64)
+    normals = np.empty((N, 3), dtype=np.float64)
+    for i, p in enumerate(platelets):
+        positions[i, :] = p.pos
+        normals[i, :] = p.n
+
+    cell_size = CONTACT_DISTANCE_THRESHOLD
+    i_idx, j_idx, angles = _find_contacts_with_cells(
+        positions, normals, BOX_SIZE,
+        CONTACT_DISTANCE_THRESHOLD,
+        cell_size
+    )
+
+    adjacency = [set() for _ in range(N)]
+    contact_types = {}
+    angle_list = []
+
+    for i, j, ang in zip(i_idx, j_idx, angles):
+        ctype = classify_contact(float(ang))
+        adjacency[int(i)].add(int(j))
+        adjacency[int(j)].add(int(i))
+        contact_types[(int(i), int(j))] = ctype
+        angle_list.append(float(ang))
+
+    return adjacency, contact_types, np.array(angle_list, dtype=float)
+
+
+# ============================================================
+# Graph utilities (degree distribution, clusters)
+# ============================================================
+
+def degree_distribution(adjacency: list) -> np.ndarray:
+    """
+    Return degree for each node.
+    """
+    return np.array([len(neigh) for neigh in adjacency], dtype=int)
+
+
+def connected_components(adjacency: list) -> list:
+    """
+    Compute connected components of an undirected graph.
+    """
+    N = len(adjacency)
+    visited = [False]*N
+    comps = []
+
+    for i in range(N):
+        if visited[i]:
+            continue
+        queue = deque([i])
+        visited[i] = True
+        comp = []
+        while queue:
+            u = queue.popleft()
+            comp.append(u)
+            for v in adjacency[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    queue.append(v)
+        comps.append(comp)
+
+    return comps
+
+
+# ============================================================
+# Visualization: discs coloured by degree with colourbar
+# ============================================================
+
+def disc_polygon(platelet: ClayPlatelet, rad: float = RADIUS, n_segments: int = 32):
+    """
+    Generate a polygon approximating the disc perimeter in 3D.
     """
     u, v, n = platelet.basis()
-    angles = np.linspace(0.0, 2.0 * np.pi, n_segments, endpoint=True)
+    angles = np.linspace(0.0, 2.0*np.pi, n_segments, endpoint=True)
     verts = []
     for a in angles:
-        verts.append(platelet.pos + rad * np.cos(a) * u + rad * np.sin(a) * v)
+        verts.append(platelet.pos + rad*np.cos(a)*u + rad*np.sin(a)*v)
     return verts
 
 
-def plot_structure(platelets: list, filename: str) -> None:
+def plot_structure_colored_by_degree(platelets: list,
+                                     degrees: np.ndarray,
+                                     phi: float,
+                                     filename: str) -> None:
     """
-    Plot the structure in 3D as discs and save to a PNG file.
-
-    For large N, we only draw up to MAX_DISCS_TO_DRAW discs to keep
-    plotting time manageable.
+    Plot 3D structure where each disc is coloured by its degree (number of contacts),
+    with a colourbar showing degree.
 
     Parameters
     ----------
-    platelets : list of ClayPlatelet
+    platelets : list[ClayPlatelet]
+    degrees   : (N,) ndarray
+        Degree for each platelet.
+    phi       : float
+        Volume fraction, printed in the title.
     filename  : str
-        Path of the PNG file to save.
+        PNG output path.
     """
     N = len(platelets)
+
     if N > MAX_DISCS_TO_DRAW:
         draw_idx = np.random.choice(N, MAX_DISCS_TO_DRAW, replace=False)
     else:
         draw_idx = np.arange(N)
 
-    fig = plt.figure(figsize=(7, 7))
+    fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(111, projection="3d")
 
+    deg_min = degrees.min()
+    deg_max = degrees.max()
+    if deg_min == deg_max:
+        deg_max = deg_min + 1
+    norm = Normalize(vmin=deg_min, vmax=deg_max)
+    cmap = plt.get_cmap("viridis")
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+
+    # draw discs
     for idx in draw_idx:
         p = platelets[idx]
+        d = degrees[idx]
+        color = cmap(norm(d))
         verts = disc_polygon(p)
-        poly = Poly3DCollection([verts], alpha=0.6)
+        poly = Poly3DCollection([verts], alpha=0.85)
         poly.set_edgecolor("k")
-        poly.set_facecolor("C0")
+        poly.set_facecolor(color)
         ax.add_collection3d(poly)
 
     centers = np.array([p.pos for p in platelets])
     ax.scatter(centers[:, 0], centers[:, 1], centers[:, 2],
-               s=3, c="red", alpha=0.3)
+               s=3, c="black", alpha=0.3)
 
     ax.set_xlim(0.0, BOX_SIZE)
     ax.set_ylim(0.0, BOX_SIZE)
@@ -473,39 +626,26 @@ def plot_structure(platelets: list, filename: str) -> None:
     ax.set_xlabel("X (nm)")
     ax.set_ylabel("Y (nm)")
     ax.set_zlabel("Z (nm)")
-    ax.set_title("House-of-cards structure snapshot")
-
     ax.set_box_aspect((1.0, 1.0, 1.0))
 
+    ax.set_title(f"House-of-cards structure\n(color = degree, φ = {phi:.4e})")
+
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Degree (number of contacts)")
+
     plt.tight_layout()
-    plt.savefig(filename, dpi=200)
+    plt.savefig(filename, dpi=220)
     plt.close()
     info(f"[INFO] Saved structure snapshot: {filename}")
 
 
 # ============================================================
-# Saving coordinates and simple stats
+# Volume fraction + saving coordinates + stats
 # ============================================================
 
 def compute_volume_fraction(n_particles: int) -> float:
     """
-    Estimate the disc volume fraction φ in the box.
-
-    Assuming each platelet is a solid cylinder with volume:
-        V_disc = π R^2 T
-
-    and the box volume is:
-        V_box = BOX_SIZE^3
-
-    Parameters
-    ----------
-    n_particles : int
-        Number of platelets.
-
-    Returns
-    -------
-    phi : float
-        Volume fraction φ = N * V_disc / V_box.
+    Estimate disc volume fraction φ = N * V_disc / V_box.
     """
     v_disc = math.pi * RADIUS**2 * THICKNESS
     v_box = BOX_SIZE**3
@@ -515,14 +655,7 @@ def compute_volume_fraction(n_particles: int) -> float:
 
 def save_coordinates(platelets: list, path: str) -> None:
     """
-    Save coordinates to CSV file with columns:
-        x, y, z, nx, ny, nz
-
-    Parameters
-    ----------
-    platelets : list of ClayPlatelet
-    path      : str
-        Output file path.
+    Save x,y,z,nx,ny,nz for each platelet as CSV.
     """
     arr = np.array([
         [p.pos[0], p.pos[1], p.pos[2],
@@ -534,26 +667,27 @@ def save_coordinates(platelets: list, path: str) -> None:
     info(f"[INFO] Saved coordinates: {path}")
 
 
+def save_stats(stats: dict, path: str) -> None:
+    """
+    Save structural statistics to a text file (key: value).
+    """
+    lines = []
+    lines.append("# House-of-cards structural statistics\n\n")
+    for k, v in stats.items():
+        lines.append(f"{k}: {v}\n")
+    with open(path, "w") as f:
+        f.writelines(lines)
+    info(f"[INFO] Saved stats: {path}")
+
+
 # ============================================================
 # Main driver
 # ============================================================
 
 def main() -> None:
-    """
-    Main function:
-
-    - Create OUTPUT_DIR if it doesn't exist.
-    - Create a unified progress bar over all configurations and particles.
-    - For each configuration:
-        * set random seed
-        * build structure (calling build_structure_with_progress)
-        * compute volume fraction
-        * save coordinates and snapshot.
-    """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Total number of "steps" in the progress bar:
-    #   each step = adding one platelet
+    # unified progress bar over all configs × particles
     total_steps = N_CONFIGS * N_PARTICLES
     pbar = tqdm(total=total_steps, desc="Total progress", leave=True)
 
@@ -563,22 +697,83 @@ def main() -> None:
 
         info(f"\n[INFO] Starting config {cfg_idx+1}/{N_CONFIGS}, seed={seed}")
 
-        # Build structure
+        # 1) build structure
         platelets = build_structure_with_progress(N_PARTICLES, pbar)
+        Np = len(platelets)
+        phi = compute_volume_fraction(Np)
+        info(f"[INFO]   N_particles = {Np}, volume fraction φ ≈ {phi:.4e}")
 
-        # Compute simple volume fraction estimate
-        phi = compute_volume_fraction(len(platelets))
-        info(f"[INFO]   Number of platelets: {len(platelets)}")
-        info(f"[INFO]   Estimated volume fraction φ ≈ {phi:.4e}")
+        # 2) build contact network
+        info("[INFO]   Building contact network (numba + cell list)...")
+        adjacency, contact_types, angles_deg = build_contact_network_fast(platelets)
 
-        # Build file names
+        degrees = degree_distribution(adjacency)
+        comps = connected_components(adjacency)
+        comp_sizes = [len(c) for c in comps]
+
+        n_contacts = len(contact_types)
+        n_T = sum(1 for c in contact_types.values() if c == "T")
+        n_parallel = sum(1 for c in contact_types.values() if c == "parallel")
+        n_other = n_contacts - n_T - n_parallel
+
+        T_fraction = n_T / n_contacts if n_contacts > 0 else 0.0
+        parallel_fraction = n_parallel / n_contacts if n_contacts > 0 else 0.0
+
+        if angles_deg.size > 0:
+            angles_eff = np.where(angles_deg > 90.0, 180.0 - angles_deg, angles_deg)
+            mean_angle = float(angles_deg.mean())
+            std_angle = float(angles_deg.std())
+            mean_angle_eff = float(angles_eff.mean())
+            std_angle_eff = float(angles_eff.std())
+        else:
+            mean_angle = float("nan")
+            std_angle = float("nan")
+            mean_angle_eff = float("nan")
+            std_angle_eff = float("nan")
+
+        mean_degree = float(degrees.mean())
+        max_degree = int(degrees.max()) if degrees.size > 0 else 0
+        largest_cluster = max(comp_sizes) if comp_sizes else 0
+        num_clusters = len(comp_sizes)
+
+        # 3) prepare stats dict
+        v_disc = math.pi * RADIUS**2 * THICKNESS
+        v_box = BOX_SIZE**3
+
+        stats = {
+            "config_index": cfg_idx,
+            "seed": seed,
+            "N_particles": Np,
+            "disc_volume_nm3": v_disc,
+            "box_volume_nm3": v_box,
+            "volume_fraction_phi": phi,
+            "PROB_NEW_SEED": PROB_NEW_SEED,
+            "CONTACT_DISTANCE_THRESHOLD_nm": CONTACT_DISTANCE_THRESHOLD,
+            "N_contacts": n_contacts,
+            "N_T_contacts": n_T,
+            "N_parallel_contacts": n_parallel,
+            "N_other_contacts": n_other,
+            "T_contact_fraction": T_fraction,
+            "parallel_contact_fraction": parallel_fraction,
+            "mean_contact_angle_deg": mean_angle,
+            "std_contact_angle_deg": std_angle,
+            "mean_contact_angle_folded_deg": mean_angle_eff,
+            "std_contact_angle_folded_deg": std_angle_eff,
+            "mean_degree": mean_degree,
+            "max_degree": max_degree,
+            "num_clusters": num_clusters,
+            "largest_cluster_size": largest_cluster,
+        }
+
+        # 4) save outputs
         postfix = f"{cfg_idx:03d}"
         coords_path = os.path.join(OUTPUT_DIR, f"hoc_structure_coords_{postfix}.csv")
+        stats_path = os.path.join(OUTPUT_DIR, f"hoc_stats_{postfix}.txt")
         fig_path = os.path.join(OUTPUT_DIR, f"hoc_structure_{postfix}.png")
 
-        # Save results
         save_coordinates(platelets, coords_path)
-        plot_structure(platelets, fig_path)
+        save_stats(stats, stats_path)
+        plot_structure_colored_by_degree(platelets, degrees, phi, fig_path)
 
         info(f"[INFO] Finished config {cfg_idx+1}/{N_CONFIGS}")
 

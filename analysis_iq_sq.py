@@ -27,7 +27,7 @@ from tqdm import tqdm         # unified progress bar + safe logging
 # CONFIGURATION
 # ============================================================
 
-DATA_DIR = "hoc_output"
+DATA_DIR = "hoc_output_prob0.8_random_n50000"
 FILE_PATTERN = "hoc_structure_coords_*.csv"
 
 # Geometry of disc (must match hoc_structural_model.py)
