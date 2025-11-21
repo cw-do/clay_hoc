@@ -8,33 +8,38 @@ Multiprocess batch generator for HoC clay disc structures.
     PHI_VALUES            = [0.005, 0.01, 0.02, 0.04, 0.06]
     PROB_NEW_SEED_VALUES  = [0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
 - For each (phi, prob_new_seed) pair, generates N_CONFIGS_PER_COMBO configurations.
-- Each configuration is handled as an independent job in a process pool.
-- For each configuration, saves:
-    * coords_XXX.csv          (x,y,z,nx,ny,nz)
-    * stats_XXX.txt           (detailed structural stats)
-    * structure_XXX.png       (degree-colored snapshot)
-    * degree_hist_XXX.csv     (degree histogram)
-    * cluster_sizes_XXX.csv   (cluster size list)
-- Also builds a master CSV:
-    hoc_database_stats.csv
-  with one row per configuration (compact descriptors for ML / analysis).
 
-Percolation:
-- Defined via spanning of the largest cluster across the box:
-    span_x = max(x) - min(x), etc.
-    percolation_flag = 1 if any(span_{x,y,z} >= BOX_SIZE - 2*RADIUS) else 0
+- Each configuration (job) does:
+    * Build structure
+    * Build contact network
+    * Compute descriptors
+    * Save:
+        - coords_XXX.csv
+        - stats_XXX.txt
+        - degree_hist_XXX.csv
+        - cluster_sizes_XXX.csv
+        - structure_XXX.png
+        - rows/row_XXXXXX.csv   <-- 1-row CSV for this config only
+
+- Master CSV:
+    hoc_database_v1/hoc_database_stats.csv
+
+  is built at the END by merging all rows/row_*.csv.
+  If the run stops midway, you still keep all finished row_*.csv files,
+  and rerunning will resume remaining jobs and then re-merge.
 """
 
 import os
 import math
 import csv
+import glob
 from dataclasses import dataclass
 
 import numpy as np
 from tqdm import tqdm
 import multiprocessing as mp
 
-import hoc_structural_model as hoc  # same directory
+import hoc_structural_model as hoc  # make sure this is in the same directory
 
 
 # ==============================
@@ -48,7 +53,7 @@ PHI_VALUES = [0.005, 0.01, 0.02, 0.04, 0.06]
 PROB_NEW_SEED_VALUES = [0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
 
 # Number of configs per (phi, prob_new_seed)
-N_CONFIGS_PER_COMBO = 20
+N_CONFIGS_PER_COMBO = 200  # <-- 큰 시뮬레이션 할 거라면 여기 조절
 
 # Box size (nm)
 BOX_SIZE = 2000.0
@@ -59,8 +64,11 @@ BASE_SEED = 0
 # Output root directory
 OUTPUT_ROOT = "hoc_database_v1"
 
+# Directory for per-job row CSVs
+ROWS_DIR = os.path.join(OUTPUT_ROOT, "rows")
+
 # Number of worker processes (None -> use mp.cpu_count())
-N_WORKERS = 8
+N_WORKERS = None
 
 
 # ==============================
@@ -92,13 +100,25 @@ def compute_N_for_phi(phi: float, box_size: float) -> int:
 def build_jobs():
     """
     Build list of Job objects covering all (phi, prob_new_seed) pairs and configs.
+
+    If rows/row_XXXXXX.csv already exists for a global_config_id, that job is skipped.
+    This allows resuming a partially completed batch.
     """
+    os.makedirs(ROWS_DIR, exist_ok=True)
+
     jobs = []
     global_id = 0
+
     for phi in PHI_VALUES:
         Np = compute_N_for_phi(phi, BOX_SIZE)
         for prob in PROB_NEW_SEED_VALUES:
             for local_idx in range(N_CONFIGS_PER_COMBO):
+                row_path = os.path.join(ROWS_DIR, f"row_{global_id:06d}.csv")
+                if os.path.exists(row_path):
+                    # this config already done in a previous run → skip
+                    global_id += 1
+                    continue
+
                 jobs.append(Job(
                     global_config_id=global_id,
                     phi_target=phi,
@@ -107,6 +127,7 @@ def build_jobs():
                     local_index=local_idx,
                 ))
                 global_id += 1
+
     return jobs
 
 
@@ -139,8 +160,8 @@ def run_job(job: Job):
 
     Returns
     -------
-    row : list
-        One row corresponding to master CSV (same order as master_headers in main()).
+    row_path : str
+        Path to the per-job row CSV that was written.
     """
     # --- Set global parameters in hoc module (per-process) ---
     hoc.BOX_SIZE = BOX_SIZE
@@ -153,7 +174,7 @@ def run_job(job: Job):
     cfg_seed = BASE_SEED + job.global_config_id
     np.random.seed(cfg_seed)
 
-    # Output directory
+    # Output directory for this (phi, prob_new_seed)
     combo_dir = ensure_combo_dir(job.phi_target, job.prob_new_seed)
 
     # Progress bar dummy (to satisfy build_structure_with_progress interface)
@@ -378,7 +399,7 @@ def run_job(job: Job):
         platelets, degrees, phi_actual, structure_png_path
     )
 
-    # --- 5) Build master CSV row (same order as master_headers) ---
+    # --- 5) Build row for this config (same order as master_headers in main) ---
     row = [
         job.global_config_id,
         job.phi_target,
@@ -419,7 +440,46 @@ def run_job(job: Job):
         os.path.relpath(cluster_sizes_path, OUTPUT_ROOT),
         os.path.relpath(structure_png_path, OUTPUT_ROOT),
     ]
-    return row
+
+    # --- 6) Save per-job row CSV (atomic output for this config) ---
+    os.makedirs(ROWS_DIR, exist_ok=True)
+    row_path = os.path.join(ROWS_DIR, f"row_{job.global_config_id:06d}.csv")
+    with open(row_path, "w", newline="") as f_row:
+        writer = csv.writer(f_row)
+        writer.writerow(row)
+
+    return row_path
+
+
+# ==============================
+# Master CSV merge
+# ==============================
+
+def merge_rows_to_master(master_csv_path: str, master_headers: list):
+    """
+    Merge all rows/row_*.csv files into a single master CSV.
+
+    Safe even if only 일부 row 파일만 존재.
+    """
+    row_files = sorted(glob.glob(os.path.join(ROWS_DIR, "row_*.csv")))
+    if not row_files:
+        print("[WARN] No row_*.csv files found in", ROWS_DIR)
+        return
+
+    with open(master_csv_path, "w", newline="") as f_master:
+        writer = csv.writer(f_master)
+        writer.writerow(master_headers)
+
+        for path in row_files:
+            with open(path, "r", newline="") as f_row:
+                reader = csv.reader(f_row)
+                for row in reader:
+                    if not row:
+                        continue
+                    writer.writerow(row)
+
+    print(f"[INFO] Master CSV written with {len(row_files)} rows.")
+    print(f"[INFO]   -> {master_csv_path}")
 
 
 # ==============================
@@ -428,8 +488,9 @@ def run_job(job: Job):
 
 def main():
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    os.makedirs(ROWS_DIR, exist_ok=True)
 
-    # Prepare job list
+    # Prepare job list (skips already-completed configs)
     jobs = build_jobs()
 
     # Master CSV header (must match row order in run_job)
@@ -475,28 +536,25 @@ def main():
         "structure_png_file",
     ]
 
-    # Run jobs in process pool
-    with mp.Pool(processes=N_WORKERS) as pool:
-        rows = []
-        for row in tqdm(
-            pool.imap_unordered(run_job, jobs),
-            total=len(jobs),
-            desc="Configs",
-            unit="cfg"
-        ):
-            rows.append(row)
+    if jobs:
+        print(f"[INFO] Pending jobs: {len(jobs)}")
+        print(f"[INFO] Running with up to {N_WORKERS or mp.cpu_count()} workers...")
 
-    # 정렬 (global_config_id 기준)
-    rows.sort(key=lambda r: r[0])
+        with mp.Pool(processes=N_WORKERS) as pool:
+            for _ in tqdm(
+                pool.imap_unordered(run_job, jobs),
+                total=len(jobs),
+                desc="Configs",
+                unit="cfg"
+            ):
+                pass
+    else:
+        print("[INFO] No pending jobs; all configs appear to be done already.")
 
-    # Write master CSV
-    with open(master_csv_path, "w", newline="") as f_master:
-        writer = csv.writer(f_master)
-        writer.writerow(master_headers)
-        writer.writerows(rows)
+    # Merge all per-job rows into master CSV
+    merge_rows_to_master(master_csv_path, master_headers)
 
-    print(f"[INFO] All batch simulations complete.")
-    print(f"[INFO] Master CSV saved to: {master_csv_path}")
+    print("[INFO] Done.")
 
 
 if __name__ == "__main__":
